@@ -1,0 +1,1005 @@
+---
+title: "SF-DATA"
+author: "Robbie Mitchell 206208535"
+date: "2025-11-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+install.packages("sf", type = "binary")
+install.packages(c("tidyverse", "lubridate", "viridis"))
+install.packages("tigris")
+install.packages("tidycensus")
+install.packages("ggthemes")
+install.packages("ggrepel")
+install.packages("geosphere")
+```
+```{r}
+install.packages("ggplot")
+```
+```{r}
+# ==========================================================
+#  Bid-Rent Curve — Median Rent vs. Distance from Financial District
+# ==========================================================
+# Requires: tidycensus, tidyverse, sf, geosphere, scales, ggplot2
+# install.packages(c("tidycensus","tidyverse","sf","geosphere","scales","ggplot2"))
+
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(geosphere)
+library(scales)
+library(ggplot2)
+
+# -------------------------
+# 1) PARAMETERS / API KEY
+# -------------------------
+state_fips <- "06"   # California
+county_fips <- "075" # San Francisco County
+year <- 2023
+var_rent <- "B25064_001"   # Median gross rent
+center_lonlat <- c(-122.3988, 37.7913)  # Pine & Market (Financial District)
+
+# -------------------------
+# 2) DOWNLOAD ACS TRACT DATA
+# -------------------------
+message("Downloading ACS tract median rent (this may take a few seconds)...")
+rent_sf <- get_acs(
+  geography = "tract",
+  state = state_fips,
+  county = county_fips,
+  variables = var_rent,
+  year = year,
+  geometry = TRUE,
+  cache_table = TRUE
+) %>%
+  rename(median_rent = estimate) %>%
+  select(GEOID, NAME, median_rent, geometry) %>%
+  st_transform(4326)
+
+if (nrow(rent_sf) == 0) stop("No tract data returned — check your Census API key and connection.")
+
+# -------------------------
+# 3) COMPUTE DISTANCE (km)
+# -------------------------
+rent_sf <- rent_sf %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    lon = st_coordinates(centroid)[,1],
+    lat = st_coordinates(centroid)[,2],
+    distance_km = distHaversine(cbind(lon, lat), matrix(center_lonlat, ncol = 2)) / 1000
+  )
+
+# -------------------------
+# 4) FILTER TO <= 12 km
+# -------------------------
+rent_sf_core <- rent_sf %>% filter(distance_km <= 12)
+
+if (nrow(rent_sf_core) == 0) stop("No tracts found within 12 km — check center coordinates or units.")
+
+# -------------------------
+# 5) FIT LINEAR MODEL
+# -------------------------
+model_lm <- lm(median_rent ~ distance_km, data = rent_sf_core)
+
+# Print detailed results
+print(summary(model_lm))
+
+# Neat equation output
+coefs <- coef(model_lm)
+intercept <- round(coefs[1], 2)
+slope <- round(coefs[2], 2)
+r2 <- round(summary(model_lm)$r.squared, 3)
+
+cat("\nLinear fit (printed separately):\n")
+cat("Median_Rent = ", intercept, ifelse(slope < 0, "- ", "+ "), abs(slope),
+    " * Distance_km\n", sep = "")
+cat("R-squared: ", r2, "\n\n", sep = "")
+
+# -------------------------
+# 6) PLOT: Bid-Rent Scatter with LOESS + Linear Fit
+# -------------------------
+p_bid_rent <- ggplot(rent_sf_core, aes(x = distance_km, y = median_rent)) +
+  geom_point(aes(color = median_rent), size = 2.5, alpha = 0.85) +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linewidth = 1.1) +  # LOESS curve
+  geom_smooth(method = "lm", se = FALSE, color = "#d73027", linewidth = 1.0, linetype = "dashed") +  # Linear fit
+  scale_color_gradientn(
+    colors = colorRampPalette(c(
+      "#313695","#4575b4","#74add1","#abd9e9",
+      "#fee090","#fdae61","#f46d43","#d73027","#a50026"
+    ))(200),
+    name = "Median Rent (USD)",
+    labels = label_dollar()
+  ) +
+  labs(
+    title = "Median Rent vs Distance from Financial District",
+    subtitle = "Census tracts (ACS 2023). Distances measured from Market & Pine Sts.",
+    x = "Distance from Financial District (km)",
+    y = "Median Rent (USD)",
+    caption = "Source: U.S. Census Bureau"
+  ) +
+  theme_minimal(base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    legend.position = "right"
+  )
+
+# -------------------------
+# 7) DISPLAY PLOT
+# -------------------------
+print(p_bid_rent)
+
+```
+
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(scales)
+
+# ------------------------------------------------------------
+# 1. Convert rent_sf to WGS84 and compute tract centroids
+# ------------------------------------------------------------
+rent_sf_ll <- st_transform(rent_sf, 4326) %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    lon = st_coordinates(centroid)[,1],
+    lat = st_coordinates(centroid)[,2]
+  )
+
+# ------------------------------------------------------------
+# 2. Remove all non-mainland tracts (Farallon Islands, misc water polygons)
+# ------------------------------------------------------------
+rent_sf_mainland <- rent_sf_ll %>%
+  filter(
+    lon > -122.55,   # west boundary
+    lon < -122.35,   # east boundary
+    lat > 37.70,     # south boundary
+    lat < 37.84      # north boundary
+  )
+
+# ------------------------------------------------------------
+# 3. Calculate dynamic breaks for rent values
+# ------------------------------------------------------------
+min_rent <- floor(min(rent_sf_mainland$median_rent, na.rm = TRUE) / 200) * 200
+max_rent <- ceiling(max(rent_sf_mainland$median_rent, na.rm = TRUE) / 200) * 200
+breaks <- seq(min_rent, max_rent, by = 200)
+
+rainbow_colors <- colorRampPalette(c(
+  "#313695", "#4575b4", "#74add1", "#abd9e9",
+  "#fee090", "#fdae61", "#f46d43", "#d73027", "#a50026"
+))(length(breaks) - 1)
+
+# ------------------------------------------------------------
+# 4. Plot the rent map (MAINLAND ONLY)
+# ------------------------------------------------------------
+p_rent_clean <- ggplot(rent_sf_mainland) +
+  geom_sf(aes(fill = median_rent), color = "white", size = 0.05) +
+  
+  scale_fill_gradientn(
+    colors = rainbow_colors,
+    breaks = breaks,
+    labels = function(x) ifelse(x %% 400 == 0, dollar(x), ""),
+    limits = c(min_rent, max_rent),
+    name = "Median Gross Rent (USD)"
+  ) +
+
+  coord_sf(datum = NA, expand = FALSE) +
+  labs(
+    title = "Median Rent by Census Tract — San Francisco",
+    subtitle = "American Community Survey 2023",
+    caption = "Each polygon = Census tract. Colors correspond to $200 rent intervals."
+  ) +
+  theme_map() +
+  theme(
+    text = element_text(family = "Helvetica", size = 14),
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    plot.subtitle = element_text(size = 13, hjust = 0.5),
+    legend.position = "bottom",
+    legend.key.width = unit(3, "cm"),
+    legend.key.height = unit(0.7, "cm"),
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 10),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  guides(fill = guide_colorbar(
+    barwidth = 20,
+    barheight = 0.8,
+    title.position = "top",
+    title.hjust = 0.5
+  ))
+
+print(p_rent_clean)
+
+```
+
+```{r}
+# --- SPATIAL MAP: Rent Growth (2018–2023) across SF Census Tracts ---
+# install.packages(c("tidycensus", "tidyverse", "sf", "scales", "viridis"))
+
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(scales)
+
+# --- PARAMETERS ---
+sf_state_fips <- "06"   # California
+sf_county_fips <- "075" # San Francisco County
+years <- c(2018, 2023)
+var_rent <- "B25064_001"  # Median gross rent
+
+# --- 1. Download ACS rent data with geometry for both years ---
+acs_list <- map(years, function(y) {
+  message("Fetching ACS ", y, " ...")
+  get_acs(
+    geography = "tract",
+    state = sf_state_fips,
+    county = sf_county_fips,
+    variables = var_rent,
+    year = y,
+    geometry = TRUE,
+    cache_table = TRUE
+  ) %>%
+    rename(median_rent = estimate) %>%
+    select(GEOID, NAME, median_rent, geometry) %>%
+    mutate(year = y)
+})
+
+sf_acs <- bind_rows(acs_list)
+
+# --- 2. Split, join safely, and compute growth ---
+rent_2018 <- sf_acs %>% 
+  filter(year == 2018) %>% 
+  select(GEOID, rent_2018 = median_rent, geometry)
+
+rent_2023 <- sf_acs %>% 
+  filter(year == 2023) %>% 
+  st_drop_geometry() %>% 
+  select(GEOID, rent_2023 = median_rent)
+
+sf_growth <- rent_2018 %>%
+  left_join(rent_2023, by = "GEOID") %>%
+  mutate(
+    rent_change = rent_2023 - rent_2018,
+    rent_growth_pct = 100 * (rent_change / rent_2018)
+  )
+
+# --- 3. Trim outliers for clearer visualization ---
+sf_growth <- sf_growth %>%
+  mutate(rent_growth_pct = pmax(pmin(rent_growth_pct, 50), -50))
+
+# --- 4. Plot map ---
+p_map <- ggplot(sf_growth) +
+  geom_sf(aes(fill = rent_growth_pct), color = "white", size = 0.1) +
+  scale_fill_gradient2(
+    low = "#d73027", mid = "white", high = "#1a9850",
+    midpoint = 0,
+    limits = c(-50, 50),
+    labels = function(x) paste0(x, "%"),
+    name = "Rent Growth\n2018 → 2023"
+  ) +
+  labs(
+    title = "Change in Median Gross Rent (2018–2023)",
+    subtitle = "Census Tracts — San Francisco County, ACS 5-Year Estimates",
+    caption = "Source: U.S. Census Bureau, ACS 5-Year (B25064_001)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    panel.grid = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+print(p_map)
+
+```
+```{r}
+# --- Commute Time Map: San Francisco County ---
+library(tidyverse)
+library(sf)
+library(scales)
+library(ggplot2)
+
+# Load your dataset (update path if needed)
+commute_data <- read_csv("Vital_Signs__Commute_Time_-_Tracts_20251106.csv")
+
+# Convert to sf object using WKT geometry
+commute_sf <- st_as_sf(commute_data, wkt = "geometry", crs = 4326)
+
+# --- Filter for San Francisco County and remove outliers ---
+sf_commute <- commute_sf %>%
+  filter(
+    str_to_lower(county) == "san francisco",
+    !is.na(average_commute_time),
+    average_commute_time > 0,
+    average_commute_time <= 180  # cap at 3 hours
+  )
+
+# --- Define color breaks (5-minute increments up to 60) ---
+breaks_labels <- seq(0, 60, by = 5)
+
+# --- Create map ---
+p_commute_sf <- ggplot(sf_commute) +
+  geom_sf(aes(fill = average_commute_time), color = "white", size = 0.08) +
+  scale_fill_gradientn(
+    colours = c("#1a9850", "#fee08b", "#d73027"),  # green → yellow → red
+    limits = c(0, 60),
+    breaks = breaks_labels,
+    labels = breaks_labels,
+    name = "Mean Commute Time (minutes)"
+  ) +
+  labs(
+    title = "Average Commute Time (San Francisco, 2023)",
+    subtitle = "Source: Vital Signs / U.S. Census Bureau",
+    caption = "Each polygon represents a Census Tract"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10),
+    panel.grid = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5)
+  ) +
+  guides(fill = guide_colorbar(
+    barwidth = 18,
+    barheight = 0.8,
+    title.position = "top",
+    title.hjust = 0.5,
+    label.position = "bottom",
+    ticks = TRUE
+  ))
+
+# --- Display map ---
+print(p_commute_sf)
+
+```
+
+```{r}
+# ==========================================================
+#  Commute Time vs. Distance from Financial District — SF Tracts
+# ==========================================================
+# Requires: tidyverse, sf, geosphere, ggplot2, scales
+# install.packages(c("tidyverse","sf","geosphere","ggplot2","scales"))
+
+library(tidyverse)
+library(sf)
+library(geosphere)
+library(ggplot2)
+library(scales)
+
+# ----------------------------------------------------------
+# 1) LOAD OR USE EXISTING SF COMMUTE DATA (from Vital Signs)
+# ----------------------------------------------------------
+# Assumes you already have `sf_commute` created with geometry and average_commute_time
+# If not, read from your Vital Signs dataset:
+# commute_data <- read_csv("Vital_Signs__Commute_Time_-_Tracts_20251106.csv")
+# sf_commute <- st_as_sf(commute_data, wkt = "geometry", crs = 4326)
+
+# ----------------------------------------------------------
+# 2) COMPUTE DISTANCE (km) FROM FINANCIAL DISTRICT
+# ----------------------------------------------------------
+center_coords <- c(-122.4014, 37.7901)  # Pine & Market
+sf_commute <- sf_commute %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    lon = st_coordinates(centroid)[,1],
+    lat = st_coordinates(centroid)[,2],
+    distance_km = distHaversine(cbind(lon, lat), matrix(center_coords, ncol = 2)) / 1000
+  )
+
+# ----------------------------------------------------------
+# 3) FILTER: Within 12 km & realistic commute times (< 180 min)
+# ----------------------------------------------------------
+sf_commute_near <- sf_commute %>%
+  filter(distance_km <= 12, average_commute_time <= 180, average_commute_time > 0)
+
+# ----------------------------------------------------------
+# 4) FIT LINEAR MODEL
+# ----------------------------------------------------------
+lm_commute <- lm(average_commute_time ~ distance_km, data = sf_commute_near)
+summary(lm_commute)
+
+# Nicely print equation and R²
+coefs <- coef(lm_commute)
+intercept <- round(coefs[1], 2)
+slope <- round(coefs[2], 2)
+r2 <- round(summary(lm_commute)$r.squared, 3)
+
+cat("\nLinear fit (printed separately):\n")
+cat("Commute_Time = ", intercept, ifelse(slope < 0, "- ", "+ "), abs(slope),
+    " * Distance_km\n", sep = "")
+cat("R-squared: ", r2, "\n\n", sep = "")
+
+# ----------------------------------------------------------
+# 5) SCATTERPLOT WITH LOESS + LINEAR MODEL
+# ----------------------------------------------------------
+p_commute_scatter <- ggplot(sf_commute_near, aes(x = distance_km, y = average_commute_time)) +
+  geom_point(alpha = 0.6, color = "#2b83ba", size = 2.5) +
+  geom_smooth(method = "loess", se = TRUE, color = "#1a9850", fill = "#fee08b", linewidth = 1.1) +  # LOESS
+  geom_smooth(method = "lm", se = FALSE, color = "#d73027", linetype = "dashed", linewidth = 1.0) +  # Linear fit
+  labs(
+    title = "Commute Time vs. Distance from Financial District",
+    subtitle = "Census Tracts — San Francisco County",
+    x = "Distance from Pine & Market (km)",
+    y = "Average Commute Time (minutes)",
+    caption = "Source: Vital Signs / ACS 2023"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5)
+  )
+
+# ----------------------------------------------------------
+# 6) DISPLAY PLOT
+# ----------------------------------------------------------
+print(p_commute_scatter)
+
+```
+
+
+```{r}
+# --- Save map to OneDrive ---
+ggsave(
+  filename = "C:/Users/robm7/OneDrive/Documents/sf_commute_time_map_vitalsigns.png",
+  plot = p_commute_sf,
+  width = 9,
+  height = 8,
+  dpi = 300
+)
+
+```
+
+
+# Then save it like this:
+```{r}
+# Base path for OneDrive Documents
+onedrive_path <- "C:/Users/robm7/OneDrive/Documents"
+
+# Save commute time scatterplot
+ggsave(
+  filename = file.path(onedrive_path, "commute_time_vs_distance.png"),
+  plot = p_commute_scatter,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+
+
+# Save bid rent curve plot
+ggsave(
+  filename = file.path(onedrive_path, "bid_rent_curve_sf.png"),
+  plot = p_bid_rent,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+```
+
+
+```{r}
+# ==========================================================
+#   Average Building Stories by Census Tract — San Francisco
+# ==========================================================
+library(sf)
+library(tidyverse)
+library(ggplot2)
+library(tidycensus)
+library(scales)
+
+# ----------------------------------------------------------
+# 1. Get San Francisco census tracts (geometry)
+# ----------------------------------------------------------
+sf_tracts <- get_acs(
+  geography = "tract",
+  state = "06",
+  county = "075",
+  variables = "B01001_001",  # dummy variable to get geometry
+  year = 2023,
+  geometry = TRUE
+) %>%
+  select(GEOID, geometry)
+
+# ----------------------------------------------------------
+# 2. Load Building Footprints GeoJSON
+# ----------------------------------------------------------
+sf_buildings <- st_read("Building_Footprints.geojson")
+sf_buildings <- st_make_valid(sf_buildings)
+
+# (Optional) drop any empty geometries
+sf_buildings <- sf_buildings[!st_is_empty(sf_buildings), ]
+
+# Then reproject
+sf_buildings <- st_transform(sf_buildings, st_crs(sf_tracts))
+
+# ----------------------------------------------------------
+# 3. Convert height (cm) → meters → stories
+# ----------------------------------------------------------
+sf_buildings <- sf_buildings %>%
+  mutate(
+    hgt_meancm = as.numeric(hgt_meancm),
+    height_m = hgt_meancm / 100,
+    stories = height_m / 3
+  ) %>%
+  filter(!is.na(stories) & stories > 0)
+
+# ----------------------------------------------------------
+# 4. Spatial join: assign buildings to census tracts
+# ----------------------------------------------------------
+buildings_by_tract <- st_join(sf_buildings, sf_tracts, join = st_intersects, left = FALSE)
+
+# ----------------------------------------------------------
+# 5. Aggregate mean stories per tract
+# ----------------------------------------------------------
+stories_by_tract <- buildings_by_tract %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  summarise(mean_stories = mean(stories, na.rm = TRUE))
+
+# Join back to tract geometries
+sf_stories_map <- sf_tracts %>%
+  left_join(stories_by_tract, by = "GEOID")
+
+# ----------------------------------------------------------
+# 6. Plot: Average Building Stories by Census Tract
+# ----------------------------------------------------------
+p_stories <- ggplot(sf_stories_map) +
+  geom_sf(aes(fill = mean_stories), color = "white", size = 0.05) +
+  scale_fill_gradientn(
+    colors = rev(viridis::magma(9)),
+    na.value = "gray90",
+    labels = function(x) paste0(round(x, 1), " stories"),
+    name = "Mean Stories"
+  ) +
+  labs(
+    title = "Average Building Height (in Stories) by Census Tract — San Francisco",
+    subtitle = "Derived from SF Building Footprints dataset (2025)",
+    caption = "Source: data.sfgov.org / Building Footprints"
+  ) +
+  theme_minimal()
+
+print(p_stories)
+
+```
+```{r}
+library(sf)
+library(ggplot2)
+library(dplyr)
+
+# -- Define city center (Pine & Market)
+sf_center <- st_sfc(st_point(c(-122.4037, 37.7913)), crs = 4326)
+
+# -- Reproject both to planar CRS (meters)
+sf_stories_map_proj <- st_transform(sf_stories_map, 26910)  # NAD83 / UTM zone 10N (meters)
+sf_center_proj <- st_transform(sf_center, 26910)
+
+# -- Compute centroids of each tract and distance to city center
+sf_stories_map_proj <- sf_stories_map_proj %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    distance_m = as.numeric(st_distance(centroid, sf_center_proj))
+  )
+
+# -- Restrict to tracts within 12 km
+sf_stories_12km <- sf_stories_map_proj %>%
+  filter(distance_m / 1000 <= 12)
+
+# -- Create scatterplot with filtered data
+p_dist <- ggplot(sf_stories_12km, aes(x = distance_m / 1000, y = mean_stories)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkred", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen") +
+  labs(
+    x = "Distance from City Center (km)",
+    y = "Average Building Stories per Tract",
+    title = "Building Height vs. Distance from Downtown SF (≤12 km)",
+    subtitle = "Dashed red = linear fit; Green = curved (LOESS) fit"
+  ) +
+  theme_minimal(base_size = 14)
+
+print(p_dist)
+
+# -- Save to Downloads
+ggsave("C:/Users/robm7/Downloads/sf_building_height_vs_distance_12km.png", plot = p_dist, width = 10, height = 7, dpi = 300)
+
+# -- Compute linear model only on tracts within 12 km
+lm_fit <- lm(mean_stories ~ I(distance_m / 1000), data = sf_stories_12km)
+coef_lm <- coef(lm_fit)
+cat("Linear Model (within 12 km): mean_stories = ", round(coef_lm[1], 3), " + ", round(coef_lm[2], 4), " * distance_km\n")
+
+
+```
+
+```{r}
+p_stories <- p_stories + coord_sf(xlim = c(-122.52, -122.36), ylim = c(37.70, 37.83), expand = FALSE)
+
+ggsave(
+  filename = "C:/Users/robm7/Downloads/sf_average_building_stories.png",
+  plot = p_stories,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+
+```
+
+```{r}
+library(sf)
+library(ggplot2)
+library(dplyr)
+
+# --- 1. Define city center (Market & Pine)
+sf_center <- st_sfc(st_point(c(-122.4037, 37.7913)), crs = 4326)
+
+# --- 2. Reproject tracts to planar CRS (meters)
+sf_pop_proj <- st_transform(sf_pop, 26910)
+sf_center_proj <- st_transform(sf_center, 26910)
+
+# --- 3. Compute centroids, distance, and area
+sf_pop_proj <- sf_pop_proj %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    distance_m = as.numeric(st_distance(centroid, sf_center_proj)),
+    area_km2 = as.numeric(st_area(geometry)) / 1e6,
+    pop_density = population / area_km2
+  )
+
+# --- 4. Filter tracts within 12 km and with valid population density
+plot_df <- sf_pop_proj %>%
+  filter(!is.na(pop_density) & distance_m / 1000 <= 12) %>%
+  st_drop_geometry()
+
+cat("Number of tracts included in scatterplot:", nrow(plot_df), "\n")
+
+# --- 5. Scatterplot
+p_density <- ggplot(plot_df, aes(x = distance_m / 1000, y = pop_density)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkred", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen") +
+  labs(
+    x = "Distance from City Center (km)",
+    y = "Population Density (people per km²)",
+    title = "Population Density vs Distance from Downtown SF ",
+    subtitle = "Dashed red = linear fit; Green = curved fit"
+  ) +
+  theme_minimal(base_size = 14)
+
+print(p_density)
+
+# --- 6. Save plot to Downloads
+ggsave("C:/Users/robm7/Downloads/sf_population_density_vs_distance_12km.png",
+       plot = p_density, width = 10, height = 7, dpi = 300)
+
+# --- 7. Linear regression
+lm_fit <- lm(pop_density ~ I(distance_m / 1000), data = plot_df)
+coef_lm <- coef(lm_fit)
+cat("Linear Model (within 12 km): pop_density = ",
+    round(coef_lm[1], 2), " + ", round(coef_lm[2], 2), " * distance_km\n")
+
+```
+```{r}
+library(tidycensus)
+library(dplyr)
+library(sf)
+
+# ----------------------------------------------------
+# 1. PULL ACS POPULATION WITH GEOMETRY
+# ----------------------------------------------------
+sf_pop <- get_acs(
+  geography = "tract",
+  state = "06",
+  county = "075",
+  variables = "B01001_001",
+  geometry = TRUE,
+  year = 2023
+) %>%
+  select(GEOID, NAME, population = estimate, geometry)
+
+# ----------------------------------------------------
+# 2. COMPUTE AREA AND POPULATION DENSITY
+# ----------------------------------------------------
+sf_pop_area <- sf_pop %>%
+  mutate(
+    area_m2 = st_area(geometry),
+    area_mi2 = as.numeric(area_m2) / 2.58999e6,     # convert to square miles
+    pop_density = population / area_mi2
+  )
+
+# ----------------------------------------------------
+# 3. DEFINE CENTERPOINT (Pine & Market)
+# ----------------------------------------------------
+sf_center <- st_sfc(st_point(c(-122.4037, 37.7913)), crs = 4326)
+
+# Project both to planar CRS (meters)
+sf_pop_proj <- st_transform(sf_pop_area, 26910)
+sf_center_proj <- st_transform(sf_center, 26910)
+
+# ----------------------------------------------------
+# 4. COMPUTE DISTANCE TO CENTER IN MILES
+# ----------------------------------------------------
+sf_pop_proj <- sf_pop_proj %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    distance_m = as.numeric(st_distance(centroid, sf_center_proj)),
+    distance_mi = distance_m * 0.000621371
+  )
+
+# ----------------------------------------------------
+# 5. CLEAN DATA FOR MODELING
+# ----------------------------------------------------
+df <- sf_pop_proj %>%
+  st_drop_geometry() %>%
+  filter(!is.nan(pop_density), !is.infinite(pop_density)) %>%
+  filter(distance_mi <= 12)   # restrict to 12 miles if desired
+
+# ----------------------------------------------------
+# 6. FIT A LOG-LINEAR DENSITY DECAY MODEL
+# ----------------------------------------------------
+# ln(density) = a + b * distance
+# b ≈ percent change per mile
+model <- lm(log(pop_density) ~ distance_mi, data = df)
+summary(model)
+
+b <- coef(model)[2]
+
+# ----------------------------------------------------
+# 7. INTERPRET THE DENSITY GRADIENT
+# ----------------------------------------------------
+density_gradient_percent <- (exp(b) - 1) * 100
+
+cat("\n-----------------------------------------------\n")
+cat("SF COUNTY DENSITY GRADIENT\n")
+cat("-----------------------------------------------\n")
+cat("Percent change in density per mile from center:\n")
+cat("  ", round(density_gradient_percent, 2), "% per mile\n")
+cat("-----------------------------------------------\n")
+
+```
+
+```{r}
+ggsave(
+  "C:/Users/robm7/Downloads/distance_rent_clean.png",
+  plot = p_bid_rent,
+  width = 10,
+  height = 9,
+  dpi = 320
+)
+```
+
+
+```{r}
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(geosphere)
+library(scales)
+library(ggplot2)
+
+# -------------------------
+# 1) PARAMETERS
+# -------------------------
+state_fips <- "06"   # California
+county_fips <- "075" # San Francisco County
+year <- 2023
+
+var_rent  <- "B25064_001"  # Median gross rent
+var_rooms <- "B25018_001"  # TRUE median number of rooms per unit
+
+center_lonlat <- c(-122.3988, 37.7913)  # Pine & Market St.
+
+# -------------------------
+# 2) DOWNLOAD ACS MEDIAN RENT
+# -------------------------
+message("Downloading median rent...")
+df_rent <- get_acs(
+  geography = "tract",
+  state = state_fips,
+  county = county_fips,
+  variables = var_rent,
+  year = year,
+  geometry = TRUE
+) %>%
+  rename(median_rent = estimate) %>%
+  select(GEOID, NAME, median_rent, geometry) %>%
+  st_transform(4326)
+
+# -------------------------
+# 3) DOWNLOAD ACS MEDIAN ROOMS
+# -------------------------
+message("Downloading median rooms...")
+df_rooms <- get_acs(
+  geography = "tract",
+  state = state_fips,
+  county = county_fips,
+  variables = var_rooms,
+  year = year,
+  geometry = FALSE
+) %>%
+  rename(median_rooms = estimate) %>%
+  select(GEOID, median_rooms)
+
+# -------------------------
+# 4) MERGE + COMPUTE DISTANCE
+# -------------------------
+rent_rooms_sf <- df_rent %>%
+  left_join(df_rooms, by = "GEOID") %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    lon = st_coordinates(centroid)[,1],
+    lat = st_coordinates(centroid)[,2],
+    distance_km = distHaversine(cbind(lon, lat), matrix(center_lonlat, ncol = 2)) / 1000,
+    rent_per_room = median_rent / median_rooms
+  )
+
+# -------------------------
+# 5) FILTER WITHIN 12 KM
+# -------------------------
+rent_rooms_core <- rent_rooms_sf %>% filter(distance_km <= 12)
+
+if(nrow(rent_rooms_core) == 0) stop("No tracts within 12 km — check coordinates.")
+
+# -------------------------
+# 6) LINEAR MODEL
+# -------------------------
+model_lm <- lm(rent_per_room ~ distance_km, data = rent_rooms_core)
+
+print(summary(model_lm))
+
+coefs <- coef(model_lm)
+intercept <- round(coefs[1], 3)
+slope <- round(coefs[2], 3)
+r2 <- round(summary(model_lm)$r.squared, 3)
+
+cat("\nLinear Model (printed separately):\n")
+cat("Rent_per_room = ", intercept,
+    ifelse(slope < 0, " - ", " + "), abs(slope),
+    " * Distance_km\n", sep = "")
+cat("R² = ", r2, "\n\n", sep = "")
+
+# -------------------------
+# 7) PLOT
+# -------------------------
+p_rent_per_room <- ggplot(rent_rooms_core, aes(x = distance_km, y = rent_per_room)) +
+  geom_point(aes(color = rent_per_room), size = 2.5, alpha = 0.85) +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linewidth = 1.1) +
+  geom_smooth(method = "lm", se = FALSE, color = "#d73027",
+              linewidth = 1.0, linetype = "dashed") +
+  scale_color_gradient(low = "#74add1", high = "#d73027",
+                       name = "Rent per Room (USD)") +
+  labs(
+    title = "Bid Rent Curve: San Francisco",
+    subtitle = "San Francisco Census Tracts ACS 2023",
+    x = "Distance from Financial District (km)",
+    y = "Bid Rent per Room (USD)",
+    caption = "Source: U.S. Census Bureau"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    legend.position = "right"
+  )
+
+print(p_rent_per_room)
+
+# Optional saving
+# ggsave("rent_per_room_vs_distance.png", p_rent_per_room, width = 9, height = 6, dpi = 300)
+
+```
+```{r}
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(geosphere)
+library(scales)
+library(ggplot2)
+
+# -------------------------
+# 1) PARAMETERS
+# -------------------------
+state_fips <- "06"   # California
+county_fips <- "075" # San Francisco
+year <- 2023
+
+var_rooms <- "B25018_001"  # Median number of rooms per housing unit
+center_lonlat <- c(-122.3988, 37.7913)  # Pine & Market
+
+# -------------------------
+# 2) DOWNLOAD ACS TRACT DATA
+# -------------------------
+message("Downloading ACS tract room counts (ACS 2023)...")
+rooms_sf <- get_acs(
+  geography = "tract",
+  state = state_fips,
+  county = county_fips,
+  variables = var_rooms,
+  year = year,
+  geometry = TRUE,
+  cache_table = TRUE
+) %>%
+  rename(num_rooms = estimate) %>%
+  select(GEOID, NAME, num_rooms, geometry) %>%
+  st_transform(4326)
+
+if (nrow(rooms_sf) == 0) stop("No ACS room data returned.")
+
+# -------------------------
+# 3) COMPUTE DISTANCE (km)
+# -------------------------
+rooms_sf <- rooms_sf %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    lon = st_coordinates(centroid)[,1],
+    lat = st_coordinates(centroid)[,2],
+    distance_km = distHaversine(cbind(lon, lat), matrix(center_lonlat, ncol = 2)) / 1000
+  )
+
+# -------------------------
+# 4) FILTER TO <= 12 KM
+# -------------------------
+rooms_core <- rooms_sf %>% filter(distance_km <= 12)
+
+if (nrow(rooms_core) == 0) stop("No tracts found within 12 km.")
+
+# -------------------------
+# 5) LINEAR MODEL
+# -------------------------
+model_lm <- lm(num_rooms ~ distance_km, data = rooms_core)
+print(summary(model_lm))
+
+coefs <- coef(model_lm)
+intercept <- round(coefs[1], 3)
+slope <- round(coefs[2], 3)
+r2 <- round(summary(model_lm)$r.squared, 3)
+
+cat("\nLinear model:\n")
+cat("Num_Rooms = ", intercept,
+    ifelse(slope < 0, " - ", " + "), abs(slope),
+    " * Distance_km\n", sep = "")
+cat("R² = ", r2, "\n\n", sep = "")
+
+# -------------------------
+# 6) PLOT: ROOMS VS DISTANCE
+# -------------------------
+p_rooms <- ggplot(rooms_core, aes(x = distance_km, y = num_rooms)) +
+  geom_point(aes(color = num_rooms), size = 2.5, alpha = 0.85) +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linewidth = 1.1) +
+  geom_smooth(method = "lm", se = FALSE, color = "#d73027",
+              linewidth = 1.0, linetype = "dashed") +
+  scale_color_gradient(low = "#74add1", high = "#d73027",
+                       name = "Rooms per Unit") +
+  labs(
+    title = "Rooms per Dwelling vs Distance from Financial District",
+    subtitle = "ACS 2023 — San Francisco Census Tracts",
+    x = "Distance from Financial District (km)",
+    y = "Median Number of Rooms",
+    caption = "Source: U.S. Census Bureau"
+  ) +
+  theme_minimal(base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    legend.position = "right"
+  )
+
+print(p_rooms)
+
+
+```
+
